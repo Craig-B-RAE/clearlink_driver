@@ -81,6 +81,8 @@ class ClearLinkNode(Node):
         # Command tracking for deadman switch
         self._last_cmd_time = time.time()
         self._cmd_lock = threading.RLock()
+        # Track if we've received first move command (need clear_faults before first move)
+        self._first_move_done = False
 
         # QoS profile for reliable communication
         qos = QoSProfile(
@@ -134,35 +136,33 @@ class ClearLinkNode(Node):
         self.get_logger().info("ClearLink node started")
 
     def _auto_enable_motors(self):
-        """Auto-enable motors on startup if no faults detected."""
+        """Auto-enable motors on startup, clearing faults first."""
         if not self._control.connected:
             self.get_logger().warn("Cannot auto-enable: not connected")
             return
 
-        # Read current status to check for faults
-        status = self._control.read_status()
-
-        # Check each axis for faults
-        faulted_axes = []
-        for i, axis_status in enumerate(status.axes[:self._num_axes]):
-            if axis_status.fault:
-                faulted_axes.append(i + 1)
-
-        if faulted_axes:
-            self.get_logger().warn(
-                f"Cannot auto-enable: faults detected on axes {faulted_axes}. "
-                "Clear faults first."
-            )
-            return
-
-        # No faults - enable all axes
+        # Clear faults on all axes first before checking status
         all_axes = list(range(1, self._num_axes + 1))
+        self.get_logger().info(f"Clearing faults on axes {all_axes}...")
+        success, msg = self._control.clear_faults(all_axes)
+        if not success:
+            self.get_logger().warn(f"Fault clear warning: {msg}")
+
+        # Now try to enable all axes
         if self._control.enable_motors(all_axes):
             self.get_logger().info(
                 f"Auto-enabled motors on axes {all_axes}"
             )
         else:
-            self.get_logger().error("Failed to auto-enable motors")
+            # Check which axes failed
+            status = self._control.read_status()
+            faulted = [i+1 for i, ax in enumerate(status.axes[:self._num_axes]) if ax.fault]
+            if faulted:
+                self.get_logger().warn(
+                    f"Some axes have faults after enable attempt: {faulted}"
+                )
+            else:
+                self.get_logger().error("Failed to auto-enable motors")
 
     def _main_loop(self):
         """Main loop - read status and publish, check deadman."""
@@ -274,7 +274,13 @@ class ClearLinkNode(Node):
 
         # Apply velocities
         accel = msg.acceleration if msg.acceleration > 0 else 10000
-        self._control.drive_velocity(velocities[:self._num_axes], accel)
+        # Clear faults before first movement to reset ClearLink state
+        if not self._first_move_done:
+            self.get_logger().info("First movement - clearing faults")
+            self._control.clear_faults(enable_axes)
+            self._first_move_done = True
+        
+        result = self._control.drive_velocity(velocities[:self._num_axes], accel)
 
         # Apply disables
         if disable_axes:

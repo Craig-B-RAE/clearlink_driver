@@ -154,14 +154,21 @@ class ClearLinkControl:
                     continue
 
                 # Set velocity
-                if not self._eip.set_velocity(axis, velocity, accel):
+                vel_ok = self._eip.set_velocity(axis, velocity, accel)
+                if not vel_ok:
                     self._logger.error(f"Failed to set velocity for axis {axis}")
                     self._errors += 1
                     success = False
                     continue
 
                 # Trigger the move
-                if not self._eip.trigger_move(axis):
+                trig_ok = self._eip.trigger_move(axis)
+                # Read back to verify
+                import time
+                time.sleep(0.01)
+                out_reg_check = self._eip._read_attr(0x66, axis, 6)
+                jog_check = self._eip._read_attr(0x66, axis, 7)
+                if not trig_ok:
                     self._logger.error(f"Failed to trigger move for axis {axis}")
                     self._errors += 1
                     success = False
