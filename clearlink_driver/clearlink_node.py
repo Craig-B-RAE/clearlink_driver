@@ -55,7 +55,7 @@ class ClearLinkNode(Node):
         super().__init__('clearlink_driver')
 
         # Declare parameters
-        self.declare_parameter(self.PARAM_IP_ADDRESS, '192.168.1.100')
+        self.declare_parameter(self.PARAM_IP_ADDRESS, '192.168.20.240')
         self.declare_parameter(self.PARAM_PORT, 44818)
         self.declare_parameter(self.PARAM_NUM_AXES, 4)
         self.declare_parameter(self.PARAM_LOOP_HZ, 10.0)
@@ -124,12 +124,45 @@ class ClearLinkNode(Node):
             )
         else:
             self.get_logger().info("Connected to ClearLink")
+            # Auto-enable motors if no faults detected
+            self._auto_enable_motors()
 
         # Create main loop timer
         loop_period = 1.0 / loop_hz
         self.create_timer(loop_period, self._main_loop)
 
         self.get_logger().info("ClearLink node started")
+
+    def _auto_enable_motors(self):
+        """Auto-enable motors on startup if no faults detected."""
+        if not self._control.connected:
+            self.get_logger().warn("Cannot auto-enable: not connected")
+            return
+
+        # Read current status to check for faults
+        status = self._control.read_status()
+
+        # Check each axis for faults
+        faulted_axes = []
+        for i, axis_status in enumerate(status.axes[:self._num_axes]):
+            if axis_status.fault:
+                faulted_axes.append(i + 1)
+
+        if faulted_axes:
+            self.get_logger().warn(
+                f"Cannot auto-enable: faults detected on axes {faulted_axes}. "
+                "Clear faults first."
+            )
+            return
+
+        # No faults - enable all axes
+        all_axes = list(range(1, self._num_axes + 1))
+        if self._control.enable_motors(all_axes):
+            self.get_logger().info(
+                f"Auto-enabled motors on axes {all_axes}"
+            )
+        else:
+            self.get_logger().error("Failed to auto-enable motors")
 
     def _main_loop(self):
         """Main loop - read status and publish, check deadman."""

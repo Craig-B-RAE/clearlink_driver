@@ -14,7 +14,7 @@ def generate_launch_description():
     # Declare launch arguments
     ip_address_arg = DeclareLaunchArgument(
         'ip_address',
-        default_value='192.168.1.100',
+        default_value='192.168.20.240',
         description='ClearLink IP address'
     )
 
