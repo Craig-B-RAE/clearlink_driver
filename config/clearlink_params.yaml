@@ -1,0 +1,18 @@
+clearlink_driver:
+  ros__parameters:
+    # ClearLink connection settings
+    ip_address: "192.168.1.100"
+    port: 44818
+
+    # Motor configuration
+    num_axes: 4
+
+    # Loop rate for status publishing
+    loop_hz: 10.0
+
+    # Deadman switch timeout (0 to disable)
+    deadman_secs: 3.0
+
+    # Topic names
+    status_topic: "/clearlink/status"
+    command_topic: "/clearlink/command"
