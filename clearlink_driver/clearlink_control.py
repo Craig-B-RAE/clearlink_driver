@@ -143,14 +143,32 @@ class ClearLinkControl:
         """
         with self._lock:
             success = True
+            print(f"[ClearLink] drive_velocity: incoming={axis_velocities}, last={self._last_velocities}", flush=True)
 
             for i, velocity in enumerate(axis_velocities):
                 axis = i + 1
                 if axis > self._num_axes:
                     break
 
-                # Skip if velocity unchanged (reduce bus traffic)
-                if velocity == self._last_velocities[i]:
+                # Always process velocity=0 (stop) commands - don't skip even if unchanged
+                # This ensures motors stop even if previous stop failed
+                if velocity != 0 and velocity == self._last_velocities[i]:
+                    self._logger.debug(f"Axis {axis}: velocity unchanged at {velocity}, skipping")
+                    continue
+
+                print(f"[ClearLink] Axis {axis}: velocity {self._last_velocities[i]} -> {velocity}", flush=True)
+
+                # Use stop_motor for velocity=0 (requires full handshake)
+                if velocity == 0:
+                    print(f"[ClearLink] Axis {axis}: calling stop_motor", flush=True)
+                    stop_ok = self._eip.stop_motor(axis)
+                    if not stop_ok:
+                        self._logger.error(f"Failed to stop axis {axis}")
+                        self._errors += 1
+                        success = False
+                        continue
+                    self._last_velocities[i] = 0
+                    self._commands_sent += 1
                     continue
 
                 # Set velocity
@@ -163,11 +181,6 @@ class ClearLinkControl:
 
                 # Trigger the move
                 trig_ok = self._eip.trigger_move(axis)
-                # Read back to verify
-                import time
-                time.sleep(0.01)
-                out_reg_check = self._eip._read_attr(0x66, axis, 6)
-                jog_check = self._eip._read_attr(0x66, axis, 7)
                 if not trig_ok:
                     self._logger.error(f"Failed to trigger move for axis {axis}")
                     self._errors += 1

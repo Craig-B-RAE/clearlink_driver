@@ -7,7 +7,7 @@ Provides publishers, subscribers, and services for motor control.
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 import threading
 import time
 
@@ -84,10 +84,12 @@ class ClearLinkNode(Node):
         # Track if we've received first move command (need clear_faults before first move)
         self._first_move_done = False
 
-        # QoS profile for reliable communication
+        # QoS profile - use VOLATILE durability to receive from all publishers
+        # (both rosbridge TRANSIENT_LOCAL and motor_controller VOLATILE)
         qos = QoSProfile(
             depth=10,
-            reliability=ReliabilityPolicy.RELIABLE
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE
         )
 
         # Create publisher
@@ -186,6 +188,7 @@ class ClearLinkNode(Node):
             msg.axis1_homed = status.axes[0].homed
             msg.axis1_position = status.axes[0].position
             msg.axis1_velocity = status.axes[0].velocity
+            msg.axis1_torque = status.axes[0].torque
 
         if len(status.axes) >= 2:
             msg.axis2_enabled = status.axes[1].enabled
@@ -194,6 +197,7 @@ class ClearLinkNode(Node):
             msg.axis2_homed = status.axes[1].homed
             msg.axis2_position = status.axes[1].position
             msg.axis2_velocity = status.axes[1].velocity
+            msg.axis2_torque = status.axes[1].torque
 
         if len(status.axes) >= 3:
             msg.axis3_enabled = status.axes[2].enabled
@@ -202,6 +206,7 @@ class ClearLinkNode(Node):
             msg.axis3_homed = status.axes[2].homed
             msg.axis3_position = status.axes[2].position
             msg.axis3_velocity = status.axes[2].velocity
+            msg.axis3_torque = status.axes[2].torque
 
         if len(status.axes) >= 4:
             msg.axis4_enabled = status.axes[3].enabled
@@ -210,6 +215,7 @@ class ClearLinkNode(Node):
             msg.axis4_homed = status.axes[3].homed
             msg.axis4_position = status.axes[3].position
             msg.axis4_velocity = status.axes[3].velocity
+            msg.axis4_torque = status.axes[3].torque
 
         # Digital I/O
         if status.digital_inputs:
@@ -279,8 +285,10 @@ class ClearLinkNode(Node):
             self.get_logger().info("First movement - clearing faults")
             self._control.clear_faults(enable_axes)
             self._first_move_done = True
-        
+
+        self.get_logger().info(f"Calling drive_velocity with velocities={velocities[:self._num_axes]}, accel={accel}")
         result = self._control.drive_velocity(velocities[:self._num_axes], accel)
+        self.get_logger().info(f"drive_velocity returned {result}")
 
         # Apply disables
         if disable_axes:

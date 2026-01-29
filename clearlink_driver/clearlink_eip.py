@@ -34,6 +34,7 @@ class AxisStatus:
     homed: bool = False
     position: int = 0
     velocity: int = 0
+    torque: float = -9999.0  # Measured torque percentage (-100 to +100, -9999 = N/A)
     shutdown: int = 0  # Raw shutdown register
 
 
@@ -108,17 +109,17 @@ class ClearLinkEIP:
     ATTR_CFG_NEG_SOFT_LIMIT = 1
     ATTR_CFG_POS_SOFT_LIMIT = 2
 
-    # Motor Output Attributes
-    ATTR_OUT_VEL_LIMIT = 2
-    ATTR_OUT_ACCEL = 3
-    ATTR_OUT_DECEL = 4
-    ATTR_OUT_POS_TARGET = 5
-    ATTR_OUT_OUTPUT_REG = 6
-    ATTR_OUT_JOG_VEL = 7
+    # Motor Output Attributes (corrected per CLAUDE.md)
+    ATTR_OUT_JOG_VEL = 2      # Jog Velocity (signed for direction)
+    ATTR_OUT_VEL_LIMIT = 3    # Velocity Limit
+    ATTR_OUT_ACCEL = 4        # Acceleration
+    ATTR_OUT_DECEL = 5        # Deceleration
+    ATTR_OUT_OUTPUT_REG = 6   # Output Register (command bits)
 
     # Motor Input Attributes
     ATTR_IN_CMD_POSITION = 1
     ATTR_IN_CMD_VELOCITY = 2
+    ATTR_IN_TORQUE = 6  # Measured torque (REAL, -100 to +100%, -9999 = N/A)
     ATTR_IN_STATUS_REG = 7
     ATTR_IN_SHUTDOWN_REG = 8
 
@@ -133,6 +134,7 @@ class ClearLinkEIP:
     BIT_MOTOR_FAULT = (1 << 9)
     BIT_ENABLED = (1 << 10)
     BIT_SHUTDOWNS_PRESENT = (1 << 17)
+    BIT_LOAD_VEL_MOVE_ACK = (1 << 20)  # Load Velocity Move Acknowledge
 
     def __init__(self, ip_address: str, port: int = 44818, num_axes: int = 4):
         self._ip_address = ip_address
@@ -252,6 +254,26 @@ class ClearLinkEIP:
             self._logger.error(f"Read attribute error: {e}")
             return None
 
+    def _read_attr_float(self, class_id: int, instance: int, attribute: int) -> Optional[float]:
+        """Read a REAL (float32) attribute."""
+        import struct
+        if not self._connected or not self._driver:
+            return None
+
+        try:
+            result = self._driver.generic_message(
+                service=0x0E,  # Get Attribute Single
+                class_code=class_id,
+                instance=instance,
+                attribute=attribute
+            )
+            if result and result.value and len(result.value) >= 4:
+                return struct.unpack('<f', result.value[:4])[0]
+            return None
+        except Exception as e:
+            self._logger.error(f"Read float attribute error: {e}")
+            return None
+
     def _write_output_reg(self, axis: int, value: int) -> bool:
         """Write the output register for an axis."""
         if axis < 1 or axis > self._num_axes:
@@ -358,6 +380,8 @@ class ClearLinkEIP:
             return False
 
         with self._lock:
+            self._logger.info(f"[set_velocity] Axis {axis}: vel={steps_per_sec}, accel={accel}")
+
             # Set velocity limit
             self._write_attr(self.MOTOR_OUTPUT_CLASS, axis,
                            self.ATTR_OUT_VEL_LIMIT, abs(steps_per_sec) + 100000)
@@ -372,36 +396,154 @@ class ClearLinkEIP:
             self._write_attr(self.MOTOR_OUTPUT_CLASS, axis,
                            self.ATTR_OUT_JOG_VEL, steps_per_sec)
 
+            # Read back to verify
+            jog_vel = self._read_attr(self.MOTOR_OUTPUT_CLASS, axis, self.ATTR_OUT_JOG_VEL)
+            self._logger.info(f"[set_velocity] Axis {axis}: jog_vel readback = {jog_vel}")
+
             return True
 
     def trigger_move(self, axis: int) -> bool:
         """Start or continue velocity movement.
 
-        IMPORTANT: To keep moving, this must be called repeatedly or
-        the move command (0x11) must be held high.
+        IMPORTANT: Before triggering a new move, must ensure any pending
+        Load Vel Move Ack is cleared. Otherwise ClearLink ignores new commands.
+        Also clears any shutdown faults that would block motion.
         """
         if axis < 1 or axis > self._num_axes:
             return False
 
         with self._lock:
-            # Write Enable + Load Velocity Move and HOLD it
-            return self._write_output_reg(axis, self.BIT_ENABLE | self.BIT_LOAD_VEL_MOVE)
+            # Check for shutdown faults that would block motion
+            shutdown_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                          self.ATTR_IN_SHUTDOWN_REG)
+            # Non-blocking bits (0x421): MotorDisabled(0x20) + MotorFaulted(0x400) + TrackingError(0x01)
+            # But 0x001 (Command While Shutdown) IS blocking, so we check for any faults
+            if shutdown_reg is not None and shutdown_reg != 0:
+                shutdown_hex = f"0x{shutdown_reg:04x}" if shutdown_reg is not None else "None"
+                self._logger.info(f"[trigger_move] Axis {axis}: shutdown={shutdown_hex}, clearing faults")
+                # Clear faults: 0xC0 = Clear Alerts (0x40) + Clear Motor Fault (0x80)
+                self._write_output_reg(axis, self.BIT_CLEAR_ALERTS | self.BIT_CLEAR_MOTOR_FAULT)
+                time.sleep(0.1)
+                self._write_output_reg(axis, 0x00)
+                time.sleep(0.05)
+                # Re-enable
+                self._write_output_reg(axis, self.BIT_ENABLE)
+                time.sleep(0.05)
+
+            # Check if there's a pending ack from previous move
+            status_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                        self.ATTR_IN_STATUS_REG)
+            ack_set = bool(status_reg & self.BIT_LOAD_VEL_MOVE_ACK) if status_reg is not None else False
+            status_hex = f"0x{status_reg:08x}" if status_reg is not None else "None"
+            self._logger.debug(f"[trigger_move] Axis {axis}: status_reg={status_hex}, ack={ack_set}")
+
+            if status_reg is not None and (status_reg & self.BIT_LOAD_VEL_MOVE_ACK):
+                self._logger.debug(f"[trigger_move] Axis {axis}: Clearing pending ack before new move")
+                # Clear Load bit first
+                self._write_output_reg(axis, self.BIT_ENABLE)
+                # Wait for ack to clear (max 100ms)
+                for i in range(10):
+                    time.sleep(0.01)
+                    status_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                                self.ATTR_IN_STATUS_REG)
+                    if status_reg is not None and not (status_reg & self.BIT_LOAD_VEL_MOVE_ACK):
+                        self._logger.debug(f"[trigger_move] Axis {axis}: Ack cleared after {i*10}ms")
+                        break
+
+            # Write Enable + Load Velocity Move
+            result = self._write_output_reg(axis, self.BIT_ENABLE | self.BIT_LOAD_VEL_MOVE)
+
+            return result
 
     def stop_motor(self, axis: int) -> bool:
-        """Stop a motor but keep it enabled."""
+        """Stop a motor but keep it enabled.
+
+        Uses the Load Velocity Move Ack handshake per ClearLink protocol.
+        Must clear any pending ack before triggering new move.
+
+        CRITICAL: The Load bit (0x10) must be cleared after stop, otherwise
+        subsequent jog commands will be ignored by ClearLink.
+        """
         if axis < 1 or axis > self._num_axes:
             return False
 
         with self._lock:
-            # Set velocity to 0
+            # Step 1: Clear any pending ack from previous move
+            status_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                        self.ATTR_IN_STATUS_REG)
+            if status_reg is not None and (status_reg & self.BIT_LOAD_VEL_MOVE_ACK):
+                self._logger.info(f"[stop_motor] Axis {axis}: Clearing pending ack first")
+                self._write_output_reg(axis, self.BIT_ENABLE)  # Clear load bit
+                # Wait for ack to clear
+                for i in range(50):
+                    status_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                                self.ATTR_IN_STATUS_REG)
+                    if status_reg is not None and not (status_reg & self.BIT_LOAD_VEL_MOVE_ACK):
+                        self._logger.info(f"[stop_motor] Axis {axis}: Pending ack cleared after {i*10}ms")
+                        break
+                    time.sleep(0.01)
+
+            # Step 2: Set velocity to 0
+            self._logger.debug(f"[stop_motor] Axis {axis}: Setting velocity to 0")
             self._write_attr(self.MOTOR_OUTPUT_CLASS, axis,
                            self.ATTR_OUT_JOG_VEL, 0)
-            # Trigger the zero-velocity move
+
+            # Step 3: Trigger the zero-velocity move
+            self._logger.debug(f"[stop_motor] Axis {axis}: Triggering with 0x11")
             self._write_output_reg(axis, self.BIT_ENABLE | self.BIT_LOAD_VEL_MOVE)
-            time.sleep(0.1)
-            # Clear move bit but keep enabled
-            self._write_output_reg(axis, self.BIT_ENABLE)
-            return True
+
+            # Step 4: Wait for Load Vel Move Ack (bit 20) to become 1
+            ack_found = False
+            for i in range(50):  # Max 500ms
+                status_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                            self.ATTR_IN_STATUS_REG)
+                if status_reg is not None and (status_reg & self.BIT_LOAD_VEL_MOVE_ACK):
+                    ack_found = True
+                    self._logger.debug(f"[stop_motor] Axis {axis}: Ack found after {i*10}ms")
+                    break
+                time.sleep(0.01)
+            if not ack_found:
+                self._logger.warning(f"[stop_motor] Axis {axis}: Ack NOT found after 500ms")
+
+            # Step 5: Clear load bit but keep enabled - WITH VERIFICATION
+            # This is critical - if Load bit stays set, motor won't respond to new commands
+            clear_success = False
+            for attempt in range(3):  # Try up to 3 times
+                self._logger.debug(f"[stop_motor] Axis {axis}: Clearing to 0x01 (attempt {attempt+1})")
+                self._write_output_reg(axis, self.BIT_ENABLE)
+                time.sleep(0.02)  # Short delay for write to take effect
+
+                # Verify the write succeeded by reading back Output Register
+                out_reg = self._read_attr(self.MOTOR_OUTPUT_CLASS, axis, self.ATTR_OUT_OUTPUT_REG)
+                if out_reg is not None:
+                    if not (out_reg & self.BIT_LOAD_VEL_MOVE):
+                        # Load bit is cleared
+                        clear_success = True
+                        self._logger.debug(f"[stop_motor] Axis {axis}: Output reg verified as 0x{out_reg:02x}")
+                        break
+                    else:
+                        self._logger.warning(f"[stop_motor] Axis {axis}: Output reg still 0x{out_reg:02x}, retrying")
+                else:
+                    self._logger.warning(f"[stop_motor] Axis {axis}: Failed to read output reg for verification")
+
+            if not clear_success:
+                self._logger.error(f"[stop_motor] Axis {axis}: FAILED to clear Load bit after 3 attempts!")
+
+            # Step 6: Wait for ack bit to clear in Status Register
+            ack_cleared = False
+            for i in range(50):  # Max 500ms
+                status_reg = self._read_attr(self.MOTOR_INPUT_CLASS, axis,
+                                            self.ATTR_IN_STATUS_REG)
+                if status_reg is not None and not (status_reg & self.BIT_LOAD_VEL_MOVE_ACK):
+                    ack_cleared = True
+                    self._logger.debug(f"[stop_motor] Axis {axis}: Ack cleared after {i*10}ms")
+                    break
+                time.sleep(0.01)
+
+            if not ack_cleared:
+                self._logger.warning(f"[stop_motor] Axis {axis}: Status Ack bit did not clear after 500ms")
+
+            return clear_success
 
     def stop_all(self) -> bool:
         """Stop all motors."""
@@ -458,6 +600,12 @@ class ClearLinkEIP:
                                  self.ATTR_IN_CMD_VELOCITY)
             if vel is not None:
                 status.velocity = vel
+
+            # Read torque (REAL value, -100 to +100%, -9999 = N/A)
+            torque = self._read_attr_float(self.MOTOR_INPUT_CLASS, axis,
+                                          self.ATTR_IN_TORQUE)
+            if torque is not None:
+                status.torque = torque
 
         return status
 
