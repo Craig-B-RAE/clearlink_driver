@@ -131,6 +131,10 @@ class ClearLinkNode(Node):
             # Auto-enable motors if no faults detected
             self._auto_enable_motors()
 
+        # Reconnect tracking
+        self._reconnect_interval = 5.0
+        self._last_reconnect_attempt = 0.0
+
         # Create main loop timer
         loop_period = 1.0 / loop_hz
         self.create_timer(loop_period, self._main_loop)
@@ -168,6 +172,27 @@ class ClearLinkNode(Node):
 
     def _main_loop(self):
         """Main loop - read status and publish, check deadman."""
+        if not self._control.connected:
+            # Publish disconnected status so UI shows fault
+            msg = MotorStatus()
+            msg.header = Header()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'clearlink'
+            msg.connected = False
+            msg.connection_error = self._control.connection_error or "Not connected"
+            self.status_pub.publish(msg)
+
+            now = time.time()
+            if now - self._last_reconnect_attempt >= self._reconnect_interval:
+                self._last_reconnect_attempt = now
+                self.get_logger().info("Attempting to reconnect to ClearLink...")
+                if self._control.reconnect():
+                    self.get_logger().info("Reconnected to ClearLink")
+                    self._auto_enable_motors()
+                else:
+                    self.get_logger().debug(f"Reconnect failed: {self._control.connection_error}")
+            return
+
         # Read status
         status = self._control.read_status()
 

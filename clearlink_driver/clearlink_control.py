@@ -87,6 +87,14 @@ class ClearLinkControl:
             self._eip.disconnect()
             self._logger.info("ClearLink control shutdown")
 
+    def reconnect(self) -> bool:
+        """Reconnect to ClearLink (disconnect + connect)."""
+        with self._lock:
+            success = self._eip.reconnect()
+            if success:
+                self._logger.info("ClearLink control reconnected")
+            return success
+
     def enable_motors(self, axes: List[int]) -> bool:
         """
         Enable specified motor axes.

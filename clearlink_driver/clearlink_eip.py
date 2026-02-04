@@ -150,6 +150,9 @@ class ClearLinkEIP:
         self._output_reg = [0] * num_axes
         # Track which motors have been enabled (to avoid disruptive re-enable)
         self._motors_enabled = [False] * num_axes
+        # Track consecutive read failures to detect connection loss
+        self._consecutive_read_failures = 0
+        self._max_read_failures = 3
 
     @property
     def connected(self) -> bool:
@@ -172,6 +175,7 @@ class ClearLinkEIP:
                 self._driver.open()
                 self._connected = True
                 self._connection_error = ""
+                self._consecutive_read_failures = 0
                 self._logger.info(f"Connected to ClearLink at {self._ip_address}")
 
                 # Initialize all axes with wide soft limits
@@ -216,6 +220,11 @@ class ClearLinkEIP:
                     self._connected = False
                     self._motors_enabled = [False] * self._num_axes
 
+    def reconnect(self) -> bool:
+        """Disconnect any stale driver, then attempt a fresh connection."""
+        self.disconnect()
+        return self.connect()
+
     def _write_attr(self, class_id: int, instance: int, attribute: int,
                     value: int) -> bool:
         """Write a DINT attribute."""
@@ -248,10 +257,16 @@ class ClearLinkEIP:
                 attribute=attribute
             )
             if result and result.value:
+                self._consecutive_read_failures = 0
                 return int.from_bytes(result.value, 'little', signed=True)
             return None
         except Exception as e:
+            self._consecutive_read_failures += 1
             self._logger.error(f"Read attribute error: {e}")
+            if self._consecutive_read_failures >= self._max_read_failures:
+                self._logger.error(f"Too many consecutive read failures ({self._consecutive_read_failures}), marking disconnected")
+                self._connected = False
+                self._connection_error = f"Read failures: {e}"
             return None
 
     def _read_attr_float(self, class_id: int, instance: int, attribute: int) -> Optional[float]:
@@ -268,10 +283,16 @@ class ClearLinkEIP:
                 attribute=attribute
             )
             if result and result.value and len(result.value) >= 4:
+                self._consecutive_read_failures = 0
                 return struct.unpack('<f', result.value[:4])[0]
             return None
         except Exception as e:
+            self._consecutive_read_failures += 1
             self._logger.error(f"Read float attribute error: {e}")
+            if self._consecutive_read_failures >= self._max_read_failures:
+                self._logger.error(f"Too many consecutive read failures ({self._consecutive_read_failures}), marking disconnected")
+                self._connected = False
+                self._connection_error = f"Read failures: {e}"
             return None
 
     def _write_output_reg(self, axis: int, value: int) -> bool:
